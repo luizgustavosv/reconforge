@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+
+reconforge_output/
+
+venv/
+.venv/
+.python-version
+
+.DS_Store

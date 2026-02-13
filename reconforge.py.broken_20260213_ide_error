@@ -21,11 +21,12 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import urlparse
 import ipaddress
 import whois
 import dns.resolver
+import nmap
 import requests
 from bs4 import BeautifulSoup
 from colorama import init, Fore, Back, Style
@@ -44,7 +45,6 @@ import io
 import base64
 import time
 import webbrowser
-import xml.etree.ElementTree as ET
 
 init(autoreset=True)
 
@@ -531,177 +531,50 @@ class ReconForge:
         self.logger.info(f"[+] DNS enumeration concluído")
     
     async def _subdomain_enumeration(self):
-        """Enumeração de subdomínios usando múltiplas fontes."""
-        self.logger.info("[*] Enumerando subdomínios (múltiplas fontes)...")
+        """Enumeração de subdomínios via Certificate Transparency (crt.sh)."""
+        self.logger.info("[*] Enumerando subdomínios...")
 
-        tasks = [
-            self._subdomain_crtsh(),
-            self._subdomain_certspotter(),
-            self._subdomain_facebook(),
-            self._subdomain_dns_bruteforce(),
-            self._subdomain_securitytrails(),
-        ]
-
-        subdomains: Set[str] = set(self.results.get("subdomains", []))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, set):
-                subdomains.update(result)
-            elif isinstance(result, Exception):
-                self.logger.debug(f"Erro em fonte de subdomínios: {result}")
-
-        self.results["subdomains"] = sorted(subdomains)
-        self.logger.info(f"[+] Encontrados {len(self.results['subdomains'])} subdomínios (múltiplas fontes)")
-
-    async def _subdomain_crtsh(self) -> Set[str]:
-        """Consulta crt.sh (Certificate Transparency)."""
-        subdomains: Set[str] = set()
         url = f"https://crt.sh/?q=%25.{self.target}&output=json"
+        subdomains = set(self.results.get("subdomains", []))
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.config.get("timeout", 30))
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(url) as response:
                     if response.status != 200:
-                        self.logger.debug(f"crt.sh status={response.status}")
-                        return subdomains
+                        self.logger.warning(
+                            f"[-] crt.sh retornou status {response.status} para {self.target}"
+                        )
+                        return
+
                     raw_text = await response.text()
                     if not raw_text.strip():
-                        return subdomains
+                        self.logger.warning("[-] Resposta vazia de crt.sh")
+                        return
+
                     data = json.loads(raw_text)
                     for entry in data:
                         name_value = str(entry.get("name_value", "")).strip().lower()
                         if not name_value:
                             continue
+
+                        # O campo name_value pode conter varios hosts separados por quebra de linha.
                         for candidate in name_value.splitlines():
                             normalized = candidate.strip().replace("*.", "")
-                            if normalized and (normalized == self.target or normalized.endswith(f".{self.target}")):
+                            if not normalized:
+                                continue
+                            if normalized == self.target or normalized.endswith(f".{self.target}"):
                                 subdomains.add(normalized)
-        except Exception as e:
-            self.logger.debug(f"Erro no crt.sh: {e}")
 
-        return subdomains
+            self.results["subdomains"] = sorted(subdomains)
+            self.logger.info(
+                f"[+] Encontrados {len(self.results['subdomains'])} subdomínios via crt.sh"
+            )
 
-    async def _subdomain_securitytrails(self) -> Set[str]:
-        """Consulta SecurityTrails API (requer API key em config.api_keys.securitytrails)."""
-        subdomains: Set[str] = set()
-        api_key = (self.config.get("api_keys") or {}).get("securitytrails")
-        if not api_key:
-            return subdomains
-
-        url = f"https://api.securitytrails.com/v1/domain/{self.target}/subdomains"
-        headers = {"APIKEY": api_key}
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.config.get("timeout", 30))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as response:
-                    if response.status != 200:
-                        return subdomains
-                    data = await response.json()
-                    for sub in data.get("subdomains", []) or []:
-                        s = str(sub).strip().lower()
-                        if s:
-                            subdomains.add(f"{s}.{self.target}")
-        except Exception as e:
-            self.logger.debug(f"Erro no SecurityTrails: {e}")
-
-        return subdomains
-
-    async def _subdomain_dns_bruteforce(self) -> Set[str]:
-        """Bruteforce básico de subdomínios via DNS (wordlist pequena)."""
-        subdomains: Set[str] = set()
-        common_subs = [
-            "www", "mail", "ftp", "api", "dev", "staging", "test", "admin", "portal", "vpn",
-            "m", "blog", "static", "cdn", "images", "docs", "help", "support",
-        ]
-
-        loop = asyncio.get_event_loop()
-
-        def check_subdomain(sub: str) -> Optional[str]:
-            try:
-                dns.resolver.resolve(sub, "A", lifetime=4)
-                return sub
-            except Exception:
-                return None
-
-        with ThreadPoolExecutor(max_workers=25) as executor:
-            futures = []
-            for sub in common_subs:
-                full_sub = f"{sub}.{self.target}"
-                futures.append(loop.run_in_executor(executor, check_subdomain, full_sub))
-
-            for future in asyncio.as_completed(futures):
-                result = await future
-                if result:
-                    subdomains.add(result)
-
-        return subdomains
-
-    async def _subdomain_certspotter(self) -> Set[str]:
-        """Consulta CertSpotter API."""
-        subdomains: Set[str] = set()
-        url = f"https://api.certspotter.com/v1/issuances?domain={self.target}&include_subdomains=true&expand=dns_names"
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.config.get("timeout", 30))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        return subdomains
-                    data = await response.json()
-                    for entry in data or []:
-                        for name in entry.get("dns_names", []) or []:
-                            n = str(name).lower().strip()
-                            if n.startswith("*."):
-                                n = n[2:]
-                            if n and (n == self.target or n.endswith(f".{self.target}")):
-                                subdomains.add(n)
-        except Exception as e:
-            self.logger.debug(f"Erro no CertSpotter: {e}")
-
-        return subdomains
-
-    async def _subdomain_facebook(self) -> Set[str]:
-        """Consulta Facebook Certificate Transparency (graph.facebook.com/certificates)."""
-        subdomains: Set[str] = set()
-        base_url = "https://graph.facebook.com/certificates"
-        params = {
-            "query": self.target,
-            "fields": "domains",
-            "limit": "10000",
-        }
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.config.get("timeout", 30))
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                next_url = base_url
-                next_params = dict(params)
-                while next_url:
-                    async with session.get(next_url, params=next_params) as response:
-                        if response.status != 200:
-                            break
-                        payload = await response.json()
-                        for item in (payload.get("data") or []):
-                            domains = item.get("domains") or []
-                            for d in domains:
-                                host = str(d).lower().strip()
-                                if host.startswith("*."):
-                                    host = host[2:]
-                                if host and (host == self.target or host.endswith(f".{self.target}")):
-                                    subdomains.add(host)
-
-                        paging = payload.get("paging") or {}
-                        # Prefer paging.next when available (includes cursor already).
-                        next_url = paging.get("next")
-                        next_params = None  # included in next_url
-                        if not next_url:
-                            break
-        except Exception as e:
-            self.logger.debug(f"Erro no Facebook CT: {e}")
-
-        return subdomains
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            self.logger.error(f"[-] Erro na enumeração de subdomínios: {exc}")
+        except Exception as exc:
+            self.logger.error(f"[-] Erro inesperado na enumeração de subdomínios: {exc}")
 
     async def _technology_fingerprint(self):
         """Fingerprint de tecnologias"""
@@ -820,67 +693,40 @@ class ReconForge:
         self.logger.info("[*] Iniciando scan de portas...")
         
         try:
-            # Linux-first: chama o binario do nmap diretamente e parseia XML (sem python-nmap).
             nmap_exe = shutil.which("nmap")
-            if not nmap_exe:
-                for candidate in ("/usr/bin/nmap", "/bin/nmap", "/usr/local/bin/nmap"):
-                    if Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            if not nmap_exe and sys.platform.startswith("win"):
+                win_candidates = [
+                    r"C:\Program Files\Nmap\nmap.exe",
+                    r"C:\Program Files (x86)\Nmap\nmap.exe",
+                ]
+                for candidate in win_candidates:
+                    if Path(candidate).exists():
                         nmap_exe = candidate
                         break
 
             if not nmap_exe:
-                self.logger.error("[-] Nmap não encontrado. Instale o pacote 'nmap' e garanta o comando 'nmap' no PATH. O scan de portas foi pulado.")
+                self.logger.error(
+                    "[-] Nmap não encontrado no sistema. No Windows, instale o Nmap e garanta nmap.exe no PATH "
+                    "ou em C:\\Program Files\\Nmap\\nmap.exe. O scan de portas foi pulado."
+                )
                 return
 
-            scan_args = ["-sV", "-sC", "-T4", "--top-ports", "1000"]
-            try:
-                is_root = (os.geteuid() == 0)
-            except AttributeError:
-                is_root = False
-            if is_root:
-                scan_args.insert(2, "-O")
-
-            cmd = [nmap_exe, *scan_args, "-oX", "-", self.target]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                self.logger.error(f"[-] Nmap retornou erro (code={proc.returncode}): {(proc.stderr or '').strip() or 'sem stderr'}")
-                return
-            xml_out = (proc.stdout or "").strip()
-            if not xml_out:
-                self.logger.error("[-] Nmap não retornou saída XML (-oX -). O scan de portas foi pulado.")
-                return
-
-            root = ET.fromstring(xml_out)
-            for host in root.findall("host"):
-                addr = None
-                for a in host.findall("address"):
-                    addr = a.get("addr")
-                    if addr:
-                        break
-                host_id = addr or self.target
-
-                for port in host.findall("./ports/port"):
-                    if port.get("protocol") != "tcp":
-                        continue
-                    portid = port.get("portid")
-                    state_el = port.find("state")
-                    state = state_el.get("state") if state_el is not None else ""
-                    if state and state != "open":
-                        continue
-
-                    svc = port.find("service")
-                    self.results["ports"].append({
-                        "host": host_id,
-                        "port": int(portid) if portid and portid.isdigit() else portid,
-                        "state": state,
-                        "service": (svc.get("name") if svc is not None else "") or "",
-                        "product": (svc.get("product") if svc is not None else "") or "",
-                        "version": (svc.get("version") if svc is not None else "") or "",
-                        "extrainfo": (svc.get("extrainfo") if svc is not None else "") or "",
-                        "tunnel": (svc.get("tunnel") if svc is not None else "") or "",
-                    })
-
-            self.logger.info(f"[+] Port scanning concluído - {len(self.results['ports'])} entradas coletadas")
+            nm = nmap.PortScanner(nmap_search_path=[str(Path(nmap_exe).parent)])
+            result = nm.scan(self.target, arguments='-sV -sC -O -T4 --top-ports 1000')
+            
+            if self.target in result['scan']:
+                host_data = result['scan'][self.target]
+                for port, port_data in host_data.get('tcp', {}).items():
+                    service_info = {
+                        "port": port,
+                        "state": port_data.get('state', ''),
+                        "service": port_data.get('name', ''),
+                        "version": port_data.get('version', ''),
+                        "product": port_data.get('product', '')
+                    }
+                    self.results["ports"].append(service_info)
+                
+                self.logger.info(f"[+] Port scanning concluído - {len(self.results['ports'])} portas abertas")
         except Exception as e:
             self.logger.error(f"[-] Erro no port scanning: {e}")
     
@@ -1028,11 +874,12 @@ class ReconForge:
         """Abre o relatório gerado no aplicativo padrão do sistema."""
         try:
             full_path = report_file.resolve()
-            if sys.platform == "darwin":
+            if sys.platform.startswith("win"):
+                os.startfile(str(full_path))
+            elif sys.platform == "darwin":
                 subprocess.run(["open", str(full_path)], check=False)
             else:
-                opener = shutil.which("xdg-open") or "xdg-open"
-                subprocess.run([opener, str(full_path)], check=False)
+                subprocess.run(["xdg-open", str(full_path)], check=False)
         except Exception as exc:
             self.logger.warning(f"[-] Falha ao abrir relatório automaticamente: {exc}")
             try:
@@ -1362,21 +1209,6 @@ class ReconForge:
                     color: #666;
                     border-top: 1px solid #ddd;
                 }
-
-                /* Grafico de portas: reduzido para ~30% do tamanho anterior em desktop. */
-                .ports-chart-wrap {
-                    width: 30%;
-                    max-width: 360px;
-                    min-width: 220px;
-                    margin: 0 auto;
-                }
-
-                @media (max-width: 900px) {
-                    .ports-chart-wrap {
-                        width: 100%;
-                        max-width: 420px;
-                    }
-                }
             </style>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
         </head>
@@ -1426,9 +1258,7 @@ class ReconForge:
 
                 <div class="section">
                     <h2>Distribuição de Portas</h2>
-                    <div class="ports-chart-wrap">
-                        <canvas id="portsChart" height="120"></canvas>
-                    </div>
+                    <canvas id="portsChart" height="120"></canvas>
                 </div>
 
                 <div class="section">
@@ -1863,4 +1693,9 @@ async def send_slack_notification(webhook: str, results: Dict):
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+
+
+
 
