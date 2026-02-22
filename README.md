@@ -1,6 +1,6 @@
 # ReconForge (Linux)
 
-Ferramenta de reconnaissance feita para rodar em Linux. Suporte a Windows foi removido.
+Ferramenta de reconnaissance feita para rodar em Linux.
 
 ## Requisitos (Linux)
 
